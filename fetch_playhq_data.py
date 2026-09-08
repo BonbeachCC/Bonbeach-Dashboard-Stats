@@ -116,6 +116,19 @@ MILESTONES_LOG_FILE = "milestones/milestones_log.json"
 # regardless — this just controls the "recent" window shown on the site).
 MILESTONES_DISPLAY_WINDOW_DAYS = 30
 
+# How many of Bonbeach's most recent completed matches to show on the
+# dashboard's "Latest Results" section. Unlike milestones, results don't need
+# a permanent log file — every run already re-walks the full fixture list for
+# every season/grade Bonbeach has ever played in (that's how new games get
+# discovered), so the latest results can just be recomputed fresh each time.
+MAX_RESULTS_SHOWN = 15
+
+# How many of Bonbeach's next upcoming (not-yet-played) matches to show on
+# the dashboard's "Upcoming Fixtures" section. Same story as results — no
+# extra API calls needed, this is recomputed fresh each run from the same
+# fixture list crawl.
+MAX_FIXTURES_SHOWN = 10
+
 HEADERS = {
     "x-api-key": X_API_KEY,
     "x-phq-tenant": X_PHQ_TENANT,
@@ -208,7 +221,9 @@ def get_grade_fixture(grade_id):
         return []
     games = []
     for round_ in data.get("rounds", []):
+        round_name = round_.get("name")
         for g in round_.get("games", []):
+            g["_round_name"] = round_name  # internal-only annotation, not a PlayHQ field
             games.append(g)
     return games
 
@@ -222,6 +237,182 @@ def get_game_summary(game_id):
     if not data:
         return None
     return data.get("data")
+
+
+# =========================================================================
+# Step 4.5: Match results ("Latest Results" dashboard section)
+# =========================================================================
+# This is deliberately best-effort. PlayHQ's public games-list response for
+# a fixture is documented (per PlayHQ's own support articles) to include a
+# "competitors" array with each side's name/score/outcome — but that's
+# confirmed for a couple of closely-related endpoints, not this exact one,
+# and cricket-specific field shapes can vary. Rather than assume and risk a
+# crash (or a whole run failing) if a field isn't where expected, every
+# extraction here degrades gracefully: a missing/unexpected field just means
+# that one detail is blank on the dashboard ("Result unknown", no score),
+# never a broken pipeline run. If results look off once real games start
+# flowing through, the Actions log will have printed a diagnostic dump (see
+# _debug_dump_competitor below) to fix it from.
+
+_debug_dumped_competitor = False  # print one diagnostic sample per run, not per game
+
+
+def _get_competitors(game):
+    """PlayHQ calls this array 'competitors' in its documented games-list
+    endpoints, but this pipeline's own working game-filter code (below, in
+    main()) has always used 'teams' for the same array — support both names
+    so this doesn't silently come up empty if the two differ."""
+    return game.get("competitors") or game.get("teams") or []
+
+
+def _competitor_name(c):
+    return c.get("name") or (c.get("club") or {}).get("name") or "Opponent"
+
+
+def _competitor_score_display(c):
+    """Best-effort human score string, e.g. '142/6 (40 ov)'. Returns None
+    (shown as a blank score on the dashboard) if no usable score field is
+    found, rather than guessing."""
+    subtotals = c.get("scoreSubtotals") or []
+    runs = wickets = overs = None
+    for s in subtotals:
+        stype = (s.get("type") or "").upper()
+        val = s.get("value")
+        if stype == "TOTAL_SCORE":
+            runs = val
+        elif stype == "TOTAL_OUTS":
+            wickets = val
+        elif stype == "TOTAL_OVERS":
+            overs = val
+    if runs is None:
+        total = c.get("scoreTotal")
+        if isinstance(total, (int, float)):
+            runs = total
+        elif isinstance(total, dict):
+            runs = total.get("value")
+    if runs is None:
+        return None
+    try:
+        runs = int(runs)
+    except (TypeError, ValueError):
+        return None
+    if wickets is not None and overs is not None:
+        return f"{runs}/{int(wickets)} ({overs} ov)"
+    if wickets is not None:
+        return f"{runs}/{int(wickets)}"
+    return str(runs)
+
+
+def _competitor_outcome(c):
+    """Normalise PlayHQ's outcome value into Won/Lost/Drew/Tied — or None
+    (shown as 'Result unknown') for anything unrecognised. Deliberately
+    conservative: an unrecognised value is left blank rather than guessed."""
+    raw = str(c.get("outcome") or c.get("result") or "").upper()
+    if raw in ("WON", "WIN", "WINNER"):
+        return "Won"
+    if raw in ("LOST", "LOSS", "LOSER"):
+        return "Lost"
+    if raw in ("DRAW", "DREW", "DRAWN"):
+        return "Drew"
+    if raw in ("TIE", "TIED"):
+        return "Tied"
+    return None
+
+
+def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names):
+    """Best-effort result for one FINAL game already known to involve
+    Bonbeach. Returns None (game just doesn't show up in Latest Results)
+    if the competitor data doesn't look like what's expected — a missing
+    card is much safer than a wrong one."""
+    global _debug_dumped_competitor
+    try:
+        competitors = _get_competitors(game)
+        if len(competitors) != 2:
+            return None
+        bb, opp = None, None
+        for c in competitors:
+            if c.get("id") in bonbeach_team_ids:
+                bb = c
+            else:
+                opp = c
+        if bb is None or opp is None:
+            return None
+
+        result = {
+            "game_id": game.get("id"),
+            "date": (game.get("schedule") or {}).get("date") or game.get("date"),
+            "bonbeach_team": bonbeach_team_names.get(bb.get("id"), "Bonbeach"),
+            "grade": bonbeach_grade_names.get(bb.get("id")),
+            "round": game.get("_round_name"),
+            "opponent": _competitor_name(opp),
+            "bonbeach_score": _competitor_score_display(bb),
+            "opponent_score": _competitor_score_display(opp),
+            "result": _competitor_outcome(bb),
+            "venue": (game.get("venue") or {}).get("name"),
+        }
+
+        degraded = result["opponent"] == "Opponent" or result["bonbeach_score"] is None or result["result"] is None
+        if degraded and not _debug_dumped_competitor:
+            print("    NOTE: match-result extraction is missing some fields on this game —")
+            print(f"    raw competitor keys seen: bonbeach={sorted(bb.keys())} opponent={sorted(opp.keys())}")
+            print("    (this is informational only — the pipeline keeps running fine either way)")
+            _debug_dumped_competitor = True
+
+        return result
+    except Exception as e:
+        print(f"    WARNING: couldn't extract a match result for game {game.get('id')}: {e}")
+        return None
+
+
+_NOT_PLAYING_STATUS_HINTS = ("CANCEL", "ABANDON", "FORFEIT", "WASHOUT", "WASHED_OUT", "POSTPONED")
+
+
+def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names):
+    """Best-effort upcoming-fixture info for a Bonbeach game that hasn't been
+    played yet (status isn't FINAL). Same defensive philosophy as
+    extract_match_result: a missing field just leaves a blank on the card,
+    never a broken run. Returns None for games that look like they're never
+    going to be played (cancelled/abandoned/postponed) or that don't clearly
+    involve one of Bonbeach's own teams."""
+    try:
+        status = str(game.get("status") or "").upper()
+        if any(word in status for word in _NOT_PLAYING_STATUS_HINTS):
+            return None
+
+        competitors = _get_competitors(game)
+        bb_id, opp = None, None
+        if len(competitors) == 2:
+            for c in competitors:
+                if c.get("id") in bonbeach_team_ids:
+                    bb_id = c.get("id")
+                else:
+                    opp = c
+        if bb_id is None:
+            # Fall back to the bare {"id": ...} shape this pipeline's own
+            # game-filter already relies on, in case a not-yet-played game
+            # doesn't carry the richer 'competitors'/'teams' fields yet.
+            for t in (game.get("teams") or []):
+                if t.get("id") in bonbeach_team_ids:
+                    bb_id = t.get("id")
+                elif opp is None:
+                    opp = t
+        if bb_id is None:
+            return None
+
+        schedule = game.get("schedule") or {}
+        return {
+            "game_id": game.get("id"),
+            "date": schedule.get("date") or game.get("date"),
+            "time": schedule.get("time"),
+            "bonbeach_team": bonbeach_team_names.get(bb_id, "Bonbeach"),
+            "grade": bonbeach_grade_names.get(bb_id),
+            "round": game.get("_round_name"),
+            "opponent": _competitor_name(opp) if opp else "TBC",
+            "venue": (game.get("venue") or {}).get("name"),
+        }
+    except Exception as e:
+        print(f"    WARNING: couldn't extract a fixture for game {game.get('id')}: {e}")
+        return None
 
 
 # =========================================================================
@@ -683,6 +874,9 @@ def main():
     games_processed = 0
     games_new_ids = set()
     games_seen = set()
+    fixtures_seen = set()
+    all_results = []   # Bonbeach match results, across every season/grade seen this run
+    all_fixtures = []  # Bonbeach upcoming (not-yet-played) games, same deal
 
     for season in seasons:
         season_id = season.get("id")
@@ -696,6 +890,8 @@ def main():
         print(f"  Bonbeach teams this season: {len(bonbeach_teams)}")
 
         bonbeach_team_ids = {t["id"] for t in bonbeach_teams}
+        bonbeach_team_names = {t["id"]: (t.get("name") or "Bonbeach") for t in bonbeach_teams}
+        bonbeach_grade_names = {t["id"]: (t.get("grade") or {}).get("name") for t in bonbeach_teams}
         grade_ids = {t["grade"]["id"] for t in bonbeach_teams if t.get("grade")}
 
         for grade_id in grade_ids:
@@ -709,9 +905,30 @@ def main():
 
             for g in relevant_games:
                 game_id = g.get("id")
-                if game_id in games_seen or g.get("status") != "FINAL":
+
+                if g.get("status") != "FINAL":
+                    # Not played yet (or in progress) — this is fixture territory,
+                    # not a result. Comes from the same fixture list already in
+                    # hand, so no extra API call either.
+                    if game_id not in fixtures_seen:
+                        fixtures_seen.add(game_id)
+                        fixture = extract_fixture(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names)
+                        if fixture:
+                            all_fixtures.append(fixture)
+                    continue
+
+                if game_id in games_seen:
                     continue
                 games_seen.add(game_id)
+
+                # Match results come straight from the fixture list we already have in
+                # hand (no extra API call), so do this for EVERY final Bonbeach game —
+                # including ones already folded into the baseline on a previous run —
+                # not just new ones. That way "Latest Results" has real content from
+                # the next run onward, without waiting for brand-new games.
+                match_result = extract_match_result(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names)
+                if match_result:
+                    all_results.append(match_result)
 
                 if game_id in counted_game_ids:
                     continue  # already folded into the baseline on a previous run
@@ -757,9 +974,30 @@ def main():
     milestones_log.extend(new_milestone_events)
     milestones_reached_display = recent_milestones(milestones_log, run_date)
 
+    # De-dupe (a game could in principle be seen twice if it spans grades data
+    # oddly) and take the most recent MAX_RESULTS_SHOWN by date, newest first.
+    seen_result_games = set()
+    deduped_results = []
+    for r in all_results:
+        if r["game_id"] in seen_result_games:
+            continue
+        seen_result_games.add(r["game_id"])
+        deduped_results.append(r)
+    deduped_results.sort(key=lambda r: r.get("date") or "", reverse=True)
+    latest_results = deduped_results[:MAX_RESULTS_SHOWN]
+
+    # Fixtures: drop anything dated before today (a not-yet-FINAL game whose
+    # date has already passed is most likely just pending a score update, not
+    # a genuine upcoming fixture), then take the soonest MAX_FIXTURES_SHOWN.
+    upcoming_fixtures = [f for f in all_fixtures if (f.get("date") or "9999-99-99") >= run_date]
+    upcoming_fixtures.sort(key=lambda f: (f.get("date") or "9999-99-99", f.get("time") or ""))
+    upcoming_fixtures = upcoming_fixtures[:MAX_FIXTURES_SHOWN]
+
     dashboard_payload = {
         "players": output,
         "milestones_reached": milestones_reached_display,
+        "latest_results": latest_results,
+        "upcoming_fixtures": upcoming_fixtures,
     }
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -772,6 +1010,8 @@ def main():
     print(f"\nDone! Wrote {len(output)} players (full career history) to {OUTPUT_FILE}")
     print(f"Baseline now covers {len(counted_game_ids)} games and {len(baseline_totals)} players.")
     print(f"Milestones log now covers {len(milestones_log)} milestones ({len(milestones_reached_display)} shown on the dashboard, last {MILESTONES_DISPLAY_WINDOW_DAYS} days).")
+    print(f"Latest Results: {len(deduped_results)} completed Bonbeach matches found, showing the {len(latest_results)} most recent.")
+    print(f"Upcoming Fixtures: {len(all_fixtures)} not-yet-played Bonbeach games found, showing the next {len(upcoming_fixtures)}.")
     print(f"Last updated: {datetime.now().strftime('%d %b %Y %H:%M')}")
     print("\nNext step: run  python build_dashboard.py")
 

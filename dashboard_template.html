@@ -218,6 +218,50 @@ Z.prototype.chain=tf,Z.prototype.commit=rf,Z.prototype.next=ef,Z.prototype.plant
   }
   .sec-head .sub{color:var(--steel);font-size:12.5px;}
 
+  /* ---------- Latest results ---------- */
+  .result-card{
+    background:linear-gradient(160deg,var(--panel) 0%, var(--panel-2) 100%);
+    border:1px solid var(--line);border-radius:10px;
+    padding:14px 18px;margin-bottom:10px;
+    display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+    position:relative;overflow:hidden;
+  }
+  .result-card::before{content:"";position:absolute;top:0;left:0;bottom:0;width:4px;}
+  .result-card.win::before{background:var(--amber);}
+  .result-card.loss::before{background:var(--red);}
+  .result-card.other::before{background:var(--steel);}
+  .result-meta{color:var(--steel);font-size:11px;text-transform:uppercase;letter-spacing:1.1px;margin-bottom:5px;}
+  .result-teams{font-size:15.5px;font-weight:700;color:var(--white);}
+  .result-teams .score{font-family:'Roboto Mono',monospace;font-weight:500;color:var(--steel);font-size:13px;margin-left:5px;}
+  .result-teams .vs{color:var(--steel);font-weight:500;font-size:12px;margin:0 6px;text-transform:uppercase;}
+  .result-badge{
+    font-family:'Teko',sans-serif;font-size:19px;font-weight:600;letter-spacing:1px;
+    padding:4px 16px;border-radius:6px;text-transform:uppercase;white-space:nowrap;
+  }
+  .result-badge.win{background:rgba(232,184,75,0.15);color:var(--amber);border:1px solid var(--amber);}
+  .result-badge.loss{background:rgba(223,62,70,0.15);color:var(--red-glow);border:1px solid var(--red);}
+  .result-badge.other{background:rgba(154,154,154,0.12);color:var(--steel);border:1px solid var(--line);}
+
+  /* ---------- Upcoming fixtures ---------- */
+  .fixture-card{
+    background:linear-gradient(160deg,var(--panel) 0%, var(--panel-2) 100%);
+    border:1px solid var(--line);border-radius:10px;
+    padding:14px 18px;margin-bottom:10px;
+    display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+    position:relative;overflow:hidden;
+  }
+  .fixture-card::before{content:"";position:absolute;top:0;left:0;bottom:0;width:4px;background:var(--red);}
+  .fixture-meta{color:var(--steel);font-size:11px;text-transform:uppercase;letter-spacing:1.1px;margin-bottom:5px;}
+  .fixture-teams{font-size:15.5px;font-weight:700;color:var(--white);}
+  .fixture-teams .vs{color:var(--steel);font-weight:500;font-size:12px;margin:0 6px;text-transform:uppercase;}
+  .fixture-venue{color:var(--steel);font-size:11.5px;margin-top:4px;}
+  .fixture-when{
+    font-family:'Teko',sans-serif;font-size:19px;font-weight:600;letter-spacing:0.5px;
+    padding:4px 16px;border-radius:6px;text-transform:uppercase;white-space:nowrap;
+    background:rgba(154,154,154,0.12);color:var(--white);border:1px solid var(--line);text-align:center;
+  }
+  .fixture-when small{display:block;font-family:'Inter',sans-serif;font-size:10.5px;font-weight:500;color:var(--steel);text-transform:none;letter-spacing:0;margin-top:1px;}
+
   /* ---------- Milestone watch board ---------- */
   .watch-scroll{
     display:flex;gap:12px;overflow-x:auto;padding-bottom:10px;margin-bottom:36px;
@@ -378,6 +422,22 @@ Z.prototype.chain=tf,Z.prototype.commit=rf,Z.prototype.next=ef,Z.prototype.plant
 
   <section>
     <div class="sec-head">
+      <h2>🏏 Latest Results</h2>
+      <div class="sub" id="resultsSub"></div>
+    </div>
+    <div id="resultsList"></div>
+  </section>
+
+  <section>
+    <div class="sec-head">
+      <h2>📅 Upcoming Fixtures</h2>
+      <div class="sub" id="fixturesSub"></div>
+    </div>
+    <div id="fixturesList"></div>
+  </section>
+
+  <section>
+    <div class="sec-head">
       <h2>⚡ Milestone Alert Board</h2>
       <div class="sub" id="watchSub"></div>
     </div>
@@ -472,6 +532,8 @@ const DASHBOARD_DATA = __PLAYERS_JSON__;
 // things working even if an old-shaped file is ever loaded by mistake.
 const PLAYERS = Array.isArray(DASHBOARD_DATA) ? DASHBOARD_DATA : (DASHBOARD_DATA.players || []);
 const MILESTONES_REACHED = Array.isArray(DASHBOARD_DATA) ? [] : (DASHBOARD_DATA.milestones_reached || []);
+const LATEST_RESULTS = Array.isArray(DASHBOARD_DATA) ? [] : (DASHBOARD_DATA.latest_results || []);
+const UPCOMING_FIXTURES = Array.isArray(DASHBOARD_DATA) ? [] : (DASHBOARD_DATA.upcoming_fixtures || []);
 
 // ---------- prep ----------
 PLAYERS.forEach(p => {
@@ -496,6 +558,87 @@ document.getElementById('statStrip').innerHTML = `
   <div class="stat-cell"><div class="num">${totalCatches.toLocaleString()}</div><div class="lbl">Club Catches</div></div>
   <div class="stat-cell hot"><div class="num">${totalWatch}</div><div class="lbl">On Milestone Watch</div></div>
 `;
+
+// ---------- latest results ----------
+document.getElementById('resultsSub').textContent = LATEST_RESULTS.length
+  ? `Last ${LATEST_RESULTS.length} completed match${LATEST_RESULTS.length===1?'':'es'}`
+  : '';
+
+function resultClass(r){
+  if(r.result === 'Won') return 'win';
+  if(r.result === 'Lost') return 'loss';
+  return 'other';
+}
+function resultLabel(r){
+  return r.result || 'Result TBC';
+}
+function formatResultDate(iso){
+  if(!iso) return '';
+  const d = new Date(iso);
+  if(isNaN(d)) return iso;
+  return d.toLocaleDateString('en-AU', {day:'numeric', month:'short', year:'numeric'});
+}
+
+function renderResults(){
+  const el = document.getElementById('resultsList');
+  if(!LATEST_RESULTS.length){
+    el.innerHTML = `<div class="empty-note">No completed match results yet — check back once games start being played.</div>`;
+    return;
+  }
+  el.innerHTML = LATEST_RESULTS.map(r => `
+    <div class="result-card ${resultClass(r)}">
+      <div>
+        <div class="result-meta">${[r.bonbeach_team, r.grade, r.round].filter(Boolean).join(' · ')}${r.date ? ' — ' + formatResultDate(r.date) : ''}</div>
+        <div class="result-teams">Bonbeach${r.bonbeach_score ? `<span class="score">${r.bonbeach_score}</span>` : ''}<span class="vs">vs</span>${r.opponent}${r.opponent_score ? `<span class="score">${r.opponent_score}</span>` : ''}</div>
+      </div>
+      <div class="result-badge ${resultClass(r)}">${resultLabel(r)}</div>
+    </div>
+  `).join('');
+}
+renderResults();
+
+// ---------- upcoming fixtures ----------
+document.getElementById('fixturesSub').textContent = UPCOMING_FIXTURES.length
+  ? `Next ${UPCOMING_FIXTURES.length} match${UPCOMING_FIXTURES.length===1?'':'es'}`
+  : '';
+
+function formatFixtureDate(iso){
+  if(!iso) return 'Date TBC';
+  const d = new Date(iso + 'T00:00:00');
+  if(isNaN(d)) return iso;
+  return d.toLocaleDateString('en-AU', {weekday:'short', day:'numeric', month:'short'});
+}
+function fixtureWhen(iso){
+  if(!iso) return 'TBC';
+  const d = new Date(iso + 'T00:00:00');
+  if(isNaN(d)) return 'TBC';
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diffDays = Math.round((d - today) / 86400000);
+  if(diffDays === 0) return 'Today';
+  if(diffDays === 1) return 'Tomorrow';
+  if(diffDays > 1 && diffDays < 7) return `In ${diffDays} days`;
+  return d.toLocaleDateString('en-AU', {day:'numeric', month:'short'});
+}
+
+function renderFixtures(){
+  const el = document.getElementById('fixturesList');
+  if(!UPCOMING_FIXTURES.length){
+    el.innerHTML = `<div class="empty-note">No upcoming fixtures scheduled yet — check back closer to the season.</div>`;
+    return;
+  }
+  el.innerHTML = UPCOMING_FIXTURES.map(fx => `
+    <div class="fixture-card">
+      <div>
+        <div class="fixture-meta">${[fx.bonbeach_team, fx.grade, fx.round].filter(Boolean).join(' · ')}</div>
+        <div class="fixture-teams">Bonbeach<span class="vs">vs</span>${fx.opponent}</div>
+        ${fx.venue ? `<div class="fixture-venue">📍 ${fx.venue}</div>` : ''}
+      </div>
+      <div class="fixture-when">${fixtureWhen(fx.date)}<small>${formatFixtureDate(fx.date)}${fx.time ? ' · ' + fx.time : ''}</small></div>
+    </div>
+  `).join('');
+}
+renderFixtures();
 
 // ---------- milestone watch board ----------
 let watchItems = [];
