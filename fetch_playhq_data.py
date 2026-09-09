@@ -194,10 +194,19 @@ def get_seasons():
 # Step 2: Teams for each season, filtered down to Bonbeach's own teams
 # =========================================================================
 
-def get_bonbeach_teams_for_season(season_id):
-    teams = list(paginated_get(f"/v1/seasons/{season_id}/teams"))
+def get_teams_for_season(season_id):
+    """EVERY team registered in a season, not just Bonbeach's — confirmed
+    live (2026-09-09) that the games-list endpoint's 'teams' field on each
+    game is just bare {"id": ...} entries with no name attached, for BOTH
+    sides. This full list is how an opponent's bare ID gets turned into an
+    actual name: same one API call this pipeline already made, just no
+    longer throwing away the non-Bonbeach rows."""
+    return list(paginated_get(f"/v1/seasons/{season_id}/teams"))
+
+
+def filter_bonbeach_teams(all_teams):
     bonbeach_teams = []
-    for t in teams:
+    for t in all_teams:
         club = t.get("club") or {}
         club_id = club.get("id")
         club_name = (club.get("name") or "").lower()
@@ -257,15 +266,41 @@ def get_game_summary(game_id):
 _debug_dumped_competitor = False  # print one diagnostic sample per run, not per game
 
 
+def _is_list_of_dicts(val):
+    return isinstance(val, list) and len(val) > 0 and all(isinstance(x, dict) for x in val)
+
+
 def _get_competitors(game):
-    """PlayHQ calls this array 'competitors' in its documented games-list
-    endpoints, but this pipeline's own working game-filter code (below, in
-    main()) has always used 'teams' for the same array — support both names
-    so this doesn't silently come up empty if the two differ."""
-    return game.get("competitors") or game.get("teams") or []
+    """Real PlayHQ data confirmed (2026-09-09, live run logs): 'teams' is a
+    list of per-team dicts — exactly what this pipeline's own game-filter
+    code (in main()) has relied on since the very start. An earlier version
+    of this function preferred a 'competitors' key instead, based on public
+    docs for a different-but-related PlayHQ endpoint; on THIS endpoint that
+    key turned out to hold something differently shaped (its elements
+    weren't dicts), which crashed every extraction. 'teams' is now tried
+    first and validated — each element must actually be a dict — before
+    ever falling back to 'competitors', so a wrongly-shaped field can never
+    cause a crash again, it just gets skipped."""
+    for key in ("teams", "competitors"):
+        val = game.get(key)
+        if _is_list_of_dicts(val):
+            return val
+    return []
 
 
-def _competitor_name(c):
+def _competitor_name(c, team_names=None):
+    """Best display name for a competitor dict. On the real games-list
+    endpoint these are bare {"id": ...} entries with no name attached, for
+    BOTH sides (confirmed live, 2026-09-09) — so the reliable source of a
+    name is the season-wide id-to-name lookup (`team_names`, built once per
+    season in main() from the full /v1/seasons/{id}/teams list), not any
+    field on the competitor dict itself. That richer 'name'/'club.name'
+    shape is kept as a fallback in case a future/different endpoint does
+    carry it directly."""
+    if team_names:
+        looked_up = team_names.get(c.get("id"))
+        if looked_up:
+            return looked_up
     return c.get("name") or (c.get("club") or {}).get("name") or "Opponent"
 
 
@@ -319,7 +354,7 @@ def _competitor_outcome(c):
     return None
 
 
-def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names):
+def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names=None):
     """Best-effort result for one FINAL game already known to involve
     Bonbeach. Returns None (game just doesn't show up in Latest Results)
     if the competitor data doesn't look like what's expected — a missing
@@ -344,7 +379,7 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
             "bonbeach_team": bonbeach_team_names.get(bb.get("id"), "Bonbeach"),
             "grade": bonbeach_grade_names.get(bb.get("id")),
             "round": game.get("_round_name"),
-            "opponent": _competitor_name(opp),
+            "opponent": _competitor_name(opp, all_team_names),
             "bonbeach_score": _competitor_score_display(bb),
             "opponent_score": _competitor_score_display(opp),
             "result": _competitor_outcome(bb),
@@ -367,7 +402,7 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
 _NOT_PLAYING_STATUS_HINTS = ("CANCEL", "ABANDON", "FORFEIT", "WASHOUT", "WASHED_OUT", "POSTPONED")
 
 
-def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names):
+def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names=None):
     """Best-effort upcoming-fixture info for a Bonbeach game that hasn't been
     played yet (status isn't FINAL). Same defensive philosophy as
     extract_match_result: a missing field just leaves a blank on the card,
@@ -392,6 +427,8 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
             # game-filter already relies on, in case a not-yet-played game
             # doesn't carry the richer 'competitors'/'teams' fields yet.
             for t in (game.get("teams") or []):
+                if not isinstance(t, dict):
+                    continue
                 if t.get("id") in bonbeach_team_ids:
                     bb_id = t.get("id")
                 elif opp is None:
@@ -407,7 +444,7 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
             "bonbeach_team": bonbeach_team_names.get(bb_id, "Bonbeach"),
             "grade": bonbeach_grade_names.get(bb_id),
             "round": game.get("_round_name"),
-            "opponent": _competitor_name(opp) if opp else "TBC",
+            "opponent": _competitor_name(opp, all_team_names) if opp else "TBC",
             "venue": (game.get("venue") or {}).get("name"),
         }
     except Exception as e:
@@ -883,7 +920,8 @@ def main():
         season_name = season.get("name")
         print(f"\nSeason: {season_name} ({season_id})")
 
-        bonbeach_teams = get_bonbeach_teams_for_season(season_id)
+        all_teams = get_teams_for_season(season_id)
+        bonbeach_teams = filter_bonbeach_teams(all_teams)
         if not bonbeach_teams:
             print("  No Bonbeach teams found in this season, skipping.")
             continue
@@ -893,6 +931,10 @@ def main():
         bonbeach_team_names = {t["id"]: (t.get("name") or "Bonbeach") for t in bonbeach_teams}
         bonbeach_grade_names = {t["id"]: (t.get("grade") or {}).get("name") for t in bonbeach_teams}
         grade_ids = {t["grade"]["id"] for t in bonbeach_teams if t.get("grade")}
+        # Every team in the season (both sides), so opponent IDs from the
+        # bare games-list "teams" field can be turned into real names —
+        # same API call already being made, just no longer thrown away.
+        all_team_names = {t["id"]: t.get("name") for t in all_teams if t.get("id") and t.get("name")}
 
         for grade_id in grade_ids:
             games = get_grade_fixture(grade_id)
@@ -912,7 +954,7 @@ def main():
                     # hand, so no extra API call either.
                     if game_id not in fixtures_seen:
                         fixtures_seen.add(game_id)
-                        fixture = extract_fixture(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names)
+                        fixture = extract_fixture(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names)
                         if fixture:
                             all_fixtures.append(fixture)
                     continue
@@ -926,7 +968,7 @@ def main():
                 # including ones already folded into the baseline on a previous run —
                 # not just new ones. That way "Latest Results" has real content from
                 # the next run onward, without waiting for brand-new games.
-                match_result = extract_match_result(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names)
+                match_result = extract_match_result(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names)
                 if match_result:
                     all_results.append(match_result)
 
