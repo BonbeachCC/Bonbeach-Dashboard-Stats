@@ -270,6 +270,24 @@ def _is_list_of_dicts(val):
     return isinstance(val, list) and len(val) > 0 and all(isinstance(x, dict) for x in val)
 
 
+def _venue_name(game):
+    """Best-effort venue name. Confirmed live (2026-09-27) that 'venue' is
+    NOT always a single dict the way earlier games assumed — the exact same
+    kind of surprise that once broke competitor extraction, just on a
+    different field. This reads defensively: a single dict works as before;
+    a list (multiple grounds/venues attached to one game) uses the first
+    entry that actually looks like a venue; anything else just means no
+    venue name shown, never a crash."""
+    v = game.get("venue")
+    if isinstance(v, dict):
+        return v.get("name")
+    if isinstance(v, list):
+        for item in v:
+            if isinstance(item, dict) and item.get("name"):
+                return item.get("name")
+    return None
+
+
 def _get_competitors(game):
     """Real PlayHQ data confirmed (2026-09-09, live run logs): 'teams' is a
     list of per-team dicts — exactly what this pipeline's own game-filter
@@ -383,7 +401,7 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
             "bonbeach_score": _competitor_score_display(bb),
             "opponent_score": _competitor_score_display(opp),
             "result": _competitor_outcome(bb),
-            "venue": (game.get("venue") or {}).get("name"),
+            "venue": _venue_name(game),
         }
 
         degraded = result["opponent"] == "Opponent" or result["bonbeach_score"] is None or result["result"] is None
@@ -445,7 +463,7 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
             "grade": bonbeach_grade_names.get(bb_id),
             "round": game.get("_round_name"),
             "opponent": _competitor_name(opp, all_team_names) if opp else "TBC",
-            "venue": (game.get("venue") or {}).get("name"),
+            "venue": _venue_name(game),
         }
     except Exception as e:
         print(f"    WARNING: couldn't extract a fixture for game {game.get('id')}: {e}")
