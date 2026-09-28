@@ -270,22 +270,60 @@ def _is_list_of_dicts(val):
     return isinstance(val, list) and len(val) > 0 and all(isinstance(x, dict) for x in val)
 
 
+def _as_dict(val):
+    """Coerce a field that's SUPPOSED to be a single dict but has now been
+    caught, twice, coming back as a list instead (first 'competitors', then
+    'venue') into a usable dict: pass a dict straight through, take the
+    first dict-shaped element out of a list, or give up and return {} for
+    anything else. Centralising this means a THIRD field turning up with
+    the same surprise degrades gracefully instead of crashing, without
+    needing yet another one-off fix."""
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, list):
+        for item in val:
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
 def _venue_name(game):
     """Best-effort venue name. Confirmed live (2026-09-27) that 'venue' is
     NOT always a single dict the way earlier games assumed — the exact same
     kind of surprise that once broke competitor extraction, just on a
-    different field. This reads defensively: a single dict works as before;
-    a list (multiple grounds/venues attached to one game) uses the first
-    entry that actually looks like a venue; anything else just means no
-    venue name shown, never a crash."""
-    v = game.get("venue")
-    if isinstance(v, dict):
-        return v.get("name")
-    if isinstance(v, list):
-        for item in v:
-            if isinstance(item, dict) and item.get("name"):
-                return item.get("name")
-    return None
+    different field."""
+    return _as_dict(game.get("venue")).get("name")
+
+
+def _schedule_dict(game):
+    """Same defensive treatment as _venue_name, for 'schedule' — which uses
+    the identical (game.get('schedule') or {}).get(...) pattern that just
+    proved unsafe for 'venue'. Not yet confirmed broken for 'schedule' too,
+    but there's no reason to wait for a second live crash to find out."""
+    return _as_dict(game.get("schedule"))
+
+
+_debug_dumped_raw_game = {"fixture": False, "result": False}
+
+
+def _maybe_dump_raw_game(game, label):
+    """Print the exact raw shape of one real game object, once per run per
+    label. Purely diagnostic — has no effect on extraction — but means the
+    NEXT log paste shows every field's real shape at once (dicts vs lists,
+    unexpected keys, etc.) instead of us finding one broken field per round
+    of back-and-forth. Wrapped in its own try/except so a dump failure can
+    never itself break a run."""
+    if _debug_dumped_raw_game.get(label):
+        return
+    _debug_dumped_raw_game[label] = True
+    try:
+        dumped = json.dumps(game, indent=2, default=str)
+        if len(dumped) > 6000:
+            dumped = dumped[:6000] + "\n... (truncated)"
+        print(f"    DIAGNOSTIC: raw shape of one real '{label}' game (printed once per run) —")
+        print(dumped)
+    except Exception as e:
+        print(f"    DIAGNOSTIC: couldn't dump raw game for '{label}': {e}")
 
 
 def _get_competitors(game):
@@ -379,6 +417,7 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
     card is much safer than a wrong one."""
     global _debug_dumped_competitor
     try:
+        _maybe_dump_raw_game(game, "result")
         competitors = _get_competitors(game)
         if len(competitors) != 2:
             return None
@@ -393,7 +432,7 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
 
         result = {
             "game_id": game.get("id"),
-            "date": (game.get("schedule") or {}).get("date") or game.get("date"),
+            "date": _schedule_dict(game).get("date") or game.get("date"),
             "bonbeach_team": bonbeach_team_names.get(bb.get("id"), "Bonbeach"),
             "grade": bonbeach_grade_names.get(bb.get("id")),
             "round": game.get("_round_name"),
@@ -428,6 +467,7 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
     going to be played (cancelled/abandoned/postponed) or that don't clearly
     involve one of Bonbeach's own teams."""
     try:
+        _maybe_dump_raw_game(game, "fixture")
         status = str(game.get("status") or "").upper()
         if any(word in status for word in _NOT_PLAYING_STATUS_HINTS):
             return None
@@ -454,7 +494,7 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
         if bb_id is None:
             return None
 
-        schedule = game.get("schedule") or {}
+        schedule = _schedule_dict(game)
         return {
             "game_id": game.get("id"),
             "date": schedule.get("date") or game.get("date"),
