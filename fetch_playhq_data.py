@@ -295,12 +295,71 @@ def _venue_name(game):
     return _as_dict(game.get("venue")).get("name")
 
 
-def _schedule_dict(game):
-    """Same defensive treatment as _venue_name, for 'schedule' — which uses
-    the identical (game.get('schedule') or {}).get(...) pattern that just
-    proved unsafe for 'venue'. Not yet confirmed broken for 'schedule' too,
-    but there's no reason to wait for a second live crash to find out."""
-    return _as_dict(game.get("schedule"))
+try:
+    from zoneinfo import ZoneInfo
+    _MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
+except Exception:
+    # Missing tzdata (can happen on a bare Windows Python install) — the
+    # pipeline still runs, dates/times just come out in UTC instead of
+    # Melbourne local, rather than crashing over a display detail.
+    _MELBOURNE_TZ = None
+
+
+def _schedule_entries(game):
+    """PlayHQ's real 'schedule' field (confirmed live, 2026-09-28) is a LIST
+    of one entry per day of the match — {"day": "1"/"2"/None, "dateTime":
+    "2026-10-03T02:30:00.000Z", "playingSurfaceId": ...} — not the single
+    {"date", "time"} dict this pipeline originally assumed (that assumption
+    was never actually confirmed against real data, and turned out to be
+    wrong — every date/time was quietly coming out blank). Returns a list of
+    dicts regardless of whether the real field is a list or a lone dict,
+    same defensive approach as _as_dict."""
+    val = game.get("schedule")
+    if isinstance(val, list):
+        return [v for v in val if isinstance(v, dict)]
+    if isinstance(val, dict):
+        return [val]
+    return []
+
+
+def _parse_schedule_entry(entry):
+    """One schedule entry -> (sort_key, date_str, time_str). Prefers the
+    confirmed-live 'dateTime' (a UTC timestamp, converted to Melbourne local
+    time so the dashboard shows the time fans actually need to turn up —
+    using the real IANA timezone database so daylight saving is handled
+    correctly for any date, not a fixed UTC+10/+11 guess). Falls back to a
+    plain 'date'/'time' pair in case some other game type ever uses that
+    shape instead."""
+    raw = entry.get("dateTime")
+    if raw:
+        try:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            local = dt.astimezone(_MELBOURNE_TZ) if _MELBOURNE_TZ else dt
+            return dt, local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+        except (ValueError, TypeError):
+            pass
+    date_str = entry.get("date")
+    if date_str:
+        return None, str(date_str), entry.get("time")
+    return None, None, None
+
+
+def _match_start_date_time(game):
+    """Best-effort (date, time) the match actually starts, in Melbourne
+    local time. A multi-day match lists one schedule entry per day — this
+    picks the EARLIEST one (day 1's start), since that's what a fan needs to
+    know, not the last day's finish. Never raises: an entry that doesn't
+    parse is just skipped."""
+    best_sort_key, best_date, best_time = None, None, None
+    for entry in _schedule_entries(game):
+        sort_key, date_str, time_str = _parse_schedule_entry(entry)
+        if date_str is None:
+            continue
+        if best_date is None:
+            best_sort_key, best_date, best_time = sort_key, date_str, time_str
+        elif sort_key is not None and (best_sort_key is None or sort_key < best_sort_key):
+            best_sort_key, best_date, best_time = sort_key, date_str, time_str
+    return best_date, best_time
 
 
 _debug_dumped_raw_game = {"fixture": False, "result": False}
@@ -430,9 +489,10 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
         if bb is None or opp is None:
             return None
 
+        _result_date, _ = _match_start_date_time(game)
         result = {
             "game_id": game.get("id"),
-            "date": _schedule_dict(game).get("date") or game.get("date"),
+            "date": _result_date or game.get("date"),
             "bonbeach_team": bonbeach_team_names.get(bb.get("id"), "Bonbeach"),
             "grade": bonbeach_grade_names.get(bb.get("id")),
             "round": game.get("_round_name"),
@@ -494,11 +554,11 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
         if bb_id is None:
             return None
 
-        schedule = _schedule_dict(game)
+        fixture_date, fixture_time = _match_start_date_time(game)
         return {
             "game_id": game.get("id"),
-            "date": schedule.get("date") or game.get("date"),
-            "time": schedule.get("time"),
+            "date": fixture_date or game.get("date"),
+            "time": fixture_time,
             "bonbeach_team": bonbeach_team_names.get(bb_id, "Bonbeach"),
             "grade": bonbeach_grade_names.get(bb_id),
             "round": game.get("_round_name"),

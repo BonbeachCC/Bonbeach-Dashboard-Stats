@@ -1,0 +1,45 @@
+name: Update Bonbeach Milestone Dashboard
+
+# Runs automatically once a day, and can also be triggered manually from the
+# Actions tab (Run workflow button) or via `gh workflow run`.
+on:
+  schedule:
+    # 20:00 UTC = 6am AEST / 7am AEDT (Melbourne). GitHub cron is fixed UTC
+    # and doesn't shift for daylight saving, so this drifts by an hour
+    # across the DST changeover — adjust here if you want it pinned exactly.
+    - cron: "0 20 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed so the workflow can commit the rebuilt HTML back
+
+jobs:
+  update-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests tzdata
+
+      - name: Fetch latest PlayHQ data
+        env:
+          PLAYHQ_API_KEY: ${{ secrets.PLAYHQ_API_KEY }}
+          PLAYHQ_TENANT: ${{ secrets.PLAYHQ_TENANT }}
+          PLAYHQ_ORG_ID: ${{ secrets.PLAYHQ_ORG_ID }}
+        run: python fetch_playhq_data.py
+
+      - name: Build dashboard HTML
+        run: python build_dashboard.py
+
+      - name: Commit and push if anything changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-update milestone dashboard [skip ci]"
+          file_pattern: "index.html Bonbeach-CC-Milestone-Dashboard-LIVE.html baseline/player_totals.json baseline/counted_game_ids.json milestones/milestones_log.json"       

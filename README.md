@@ -100,7 +100,11 @@ You don't need to do this if the GitHub Actions automation above is set up —
 it's only useful for testing changes to the scripts before pushing.
 
 1. Install Python from https://www.python.org/downloads/ (tick "Add to PATH"
-   during install on Windows), then `pip install requests`.
+   during install on Windows), then `pip install requests tzdata` (`tzdata`
+   gives Windows the timezone database it doesn't ship with by default, so
+   fixture/result dates convert correctly to Melbourne local time — Mac and
+   Linux already have this built in, but installing it there too is
+   harmless).
 2. Set the credentials as environment variables (PowerShell example):
    ```
    $env:PLAYHQ_API_KEY = "your-key-here"
