@@ -19,6 +19,11 @@ OUTPUT_FILE = "Bonbeach-CC-Milestone-Dashboard-LIVE.html"
 # dashboard at the site's base URL without needing the exact filename.
 PAGES_OUTPUT_FILE = "index.html"
 
+# Second page: fixtures, ladder and results — same players_data.json, a
+# separate lightweight template, linked to/from the main dashboard above.
+FIXTURES_TEMPLATE_FILE = "fixtures_template.html"
+FIXTURES_OUTPUT_FILE = "fixtures.html"
+
 def current_date_display():
     """Today's date, in Melbourne local time where possible (the workflow's
     schedule is pinned to AEST/AEDT — using UTC here would sometimes show
@@ -32,29 +37,38 @@ def current_date_display():
         now = datetime.now()
     return now.strftime("%d %b %Y")
 
+def build_page(template_file, players_json, last_updated, *output_files):
+    """Inject the same players_data.json payload into one template and
+    write the result to one or more output paths (index.html and the
+    friendly-named file both get the main dashboard's content, for
+    instance)."""
+    with open(template_file, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    if "__PLAYERS_JSON__" not in html:
+        raise SystemExit(f"ERROR: {template_file} is missing the __PLAYERS_JSON__ placeholder.")
+    if "__LAST_UPDATED__" not in html:
+        raise SystemExit(f"ERROR: {template_file} is missing the __LAST_UPDATED__ placeholder.")
+
+    html = html.replace("__PLAYERS_JSON__", players_json)
+    html = html.replace("__LAST_UPDATED__", last_updated)
+
+    for output_file in output_files:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
 def main():
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         players_json = f.read()
         json.loads(players_json)  # sanity check it's valid JSON before we embed it
 
-    with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
-        html = f.read()
+    last_updated = current_date_display()
 
-    if "__PLAYERS_JSON__" not in html:
-        raise SystemExit("ERROR: dashboard_template.html is missing the __PLAYERS_JSON__ placeholder.")
-    if "__LAST_UPDATED__" not in html:
-        raise SystemExit("ERROR: dashboard_template.html is missing the __LAST_UPDATED__ placeholder.")
+    build_page(TEMPLATE_FILE, players_json, last_updated, OUTPUT_FILE, PAGES_OUTPUT_FILE)
+    build_page(FIXTURES_TEMPLATE_FILE, players_json, last_updated, FIXTURES_OUTPUT_FILE)
 
-    html = html.replace("__PLAYERS_JSON__", players_json)
-    html = html.replace("__LAST_UPDATED__", current_date_display())
-
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    with open(PAGES_OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    print(f"Done! Open {OUTPUT_FILE} (or {PAGES_OUTPUT_FILE}) in your browser.")
+    print(f"Done! Open {OUTPUT_FILE} (or {PAGES_OUTPUT_FILE}) — and {FIXTURES_OUTPUT_FILE} for fixtures/ladder — in your browser.")
 
 if __name__ == "__main__":
     main()

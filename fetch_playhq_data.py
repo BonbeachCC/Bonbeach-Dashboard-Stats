@@ -239,6 +239,143 @@ def get_grade_fixture(grade_id):
 
 
 # =========================================================================
+# Step 3.5: Ladder (competition standings) for each grade Bonbeach plays in
+# =========================================================================
+# Same "best-effort, never crash" philosophy as everything else in this file
+# — and extra caution is warranted here specifically: this endpoint's exact
+# response shape has NOT been confirmed against real data the way games/
+# teams/seasons have been (this pipeline has no way to call PlayHQ's live API
+# itself to check — only a real Actions run can do that). PlayHQ's own
+# support docs describe fields like played/won/lost/drawn/points/percentage/
+# ranking, but possibly under a "headers" + per-team "values" array rather
+# than named fields directly. _find_ladder_rows/_ladder_row_stats hunt
+# through a few plausible shapes rather than assuming one, and
+# _maybe_dump_raw_ladder prints the real thing once per run — so if this
+# first guess is wrong, the next log paste shows exactly what to fix,
+# without the ladder feature ever being able to break the rest of the run.
+
+def get_grade_ladder(grade_id):
+    data = api_get(f"/v2/grades/{grade_id}/ladders")
+    if not data:
+        return None
+    return data
+
+
+_debug_dumped_raw_ladder = False
+
+
+def _maybe_dump_raw_ladder(ladder_data, grade_id):
+    """Same purpose as _maybe_dump_raw_game — print the real raw ladder
+    response once per run so it can be checked against what
+    _find_ladder_rows/_ladder_row_stats actually expect, without needing a
+    second round of back-and-forth if the guessed shape is wrong."""
+    global _debug_dumped_raw_ladder
+    if _debug_dumped_raw_ladder:
+        return
+    _debug_dumped_raw_ladder = True
+    try:
+        dumped = json.dumps(ladder_data, indent=2, default=str)
+        if len(dumped) > 6000:
+            dumped = dumped[:6000] + "\n... (truncated)"
+        print(f"    DIAGNOSTIC: raw shape of one real ladder response (grade {grade_id}, printed once per run) —")
+        print(dumped)
+    except Exception as e:
+        print(f"    DIAGNOSTIC: couldn't dump raw ladder for grade {grade_id}: {e}")
+
+
+def _find_ladder_rows(ladder_data):
+    """Hunt for the actual list of per-team ladder rows inside whatever
+    PlayHQ's real response turns out to be, rather than assuming one exact
+    path. Tries the most likely shapes first."""
+    if not isinstance(ladder_data, dict):
+        return []
+    row_keys = ("positions", "rows", "ladder", "standings", "entries")
+    top = ladder_data.get("data", ladder_data)
+    containers = top if isinstance(top, list) else [top]
+    rows = []
+    for item in containers:
+        if not isinstance(item, dict):
+            continue
+        found_here = False
+        for key in row_keys:
+            val = item.get(key)
+            if isinstance(val, list) and val:
+                rows.extend(x for x in val if isinstance(x, dict))
+                found_here = True
+        if not found_here and item.get("team") and (
+            "played" in item or "values" in item or "won" in item
+        ):
+            # `item` itself already looks like one row, not a wrapper.
+            rows.append(item)
+    return rows
+
+
+def _ladder_row_team_id_name(row, all_team_names=None):
+    team = row.get("team")
+    if isinstance(team, dict):
+        name = team.get("name") or (all_team_names or {}).get(team.get("id"))
+        return team.get("id"), name or team.get("id") or "Unknown"
+    return None, "Unknown"
+
+
+def _ladder_row_stats(row):
+    """Best-effort played/won/lost/drawn/points/percentage — tries several
+    plausible key names (PlayHQ's docs list played/won/lost/drawn/byes/
+    pointsFor/pointsAgainst/forfeits/adjustments/percentage/
+    competitionPoints/pointsAverage/ranking) before giving up on a field."""
+    field_aliases = {
+        "played": ("played",),
+        "won": ("won",),
+        "lost": ("lost",),
+        "drawn": ("drawn", "tied"),
+        "points": ("competitionPoints", "points"),
+        "percentage": ("percentage", "pointsAverage"),
+        "ranking": ("ranking", "rank", "position"),
+    }
+    stats = {}
+    for out_key, aliases in field_aliases.items():
+        for a in aliases:
+            if a in row and row.get(a) is not None:
+                stats[out_key] = row.get(a)
+                break
+    if "played" not in stats and isinstance(row.get("values"), list):
+        # The row's stats might be a bare list of numbers meant to line up
+        # with a separate "headers" list this pipeline doesn't have access
+        # to test against yet — keep them rather than lose the data.
+        stats["raw_values"] = row.get("values")
+    return stats
+
+
+def extract_ladder(ladder_data, grade_id, grade_name, bonbeach_team_ids, all_team_names=None):
+    """One grade's ladder -> a dashboard-ready dict, or None if nothing
+    usable could be found (never raises)."""
+    try:
+        _maybe_dump_raw_ladder(ladder_data, grade_id)
+        rows = _find_ladder_rows(ladder_data)
+        if not rows:
+            return None
+        out_rows = []
+        for i, row in enumerate(rows):
+            team_id, team_name = _ladder_row_team_id_name(row, all_team_names)
+            stats = _ladder_row_stats(row)
+            out_rows.append({
+                "ranking": stats.get("ranking", i + 1),
+                "team": team_name,
+                "is_bonbeach": team_id in bonbeach_team_ids,
+                "played": stats.get("played"),
+                "won": stats.get("won"),
+                "lost": stats.get("lost"),
+                "drawn": stats.get("drawn"),
+                "points": stats.get("points"),
+                "percentage": stats.get("percentage"),
+            })
+        return {"grade_id": grade_id, "grade_name": grade_name, "rows": out_rows}
+    except Exception as e:
+        print(f"    WARNING: couldn't extract ladder for grade {grade_id}: {e}")
+        return None
+
+
+# =========================================================================
 # Step 4: Full game summary (this has the batting/bowling/fielding stats)
 # =========================================================================
 
@@ -1037,6 +1174,7 @@ def main():
     # i.e. the season actually being played right now. "Latest Results" is
     # scoped to just this, so old seasons never show up there again once a
     # new one starts — no need to hand-maintain a season name/year anywhere.
+    all_ladders = []  # one entry per grade Bonbeach plays in, current season only
 
     for season in seasons:
         season_id = season.get("id")
@@ -1054,6 +1192,7 @@ def main():
         bonbeach_team_names = {t["id"]: (t.get("name") or "Bonbeach") for t in bonbeach_teams}
         bonbeach_grade_names = {t["id"]: (t.get("grade") or {}).get("name") for t in bonbeach_teams}
         grade_ids = {t["grade"]["id"] for t in bonbeach_teams if t.get("grade")}
+        grade_names_by_id = {t["grade"]["id"]: t["grade"].get("name") for t in bonbeach_teams if t.get("grade")}
         # Every team in the season (both sides), so opponent IDs from the
         # bare games-list "teams" field can be turned into real names —
         # same API call already being made, just no longer thrown away.
@@ -1108,6 +1247,19 @@ def main():
                     games_processed += 1
                     if games_processed % 25 == 0:
                         print(f"      ...{games_processed} new games processed so far")
+
+        # Ladders: only worth fetching for the CURRENT season (this season
+        # just turned out to have upcoming fixtures) — no point pulling
+        # standings for a season that's long finished.
+        if season_id in current_season_ids:
+            for grade_id in grade_ids:
+                ladder_data = get_grade_ladder(grade_id)
+                time.sleep(REQUEST_DELAY_SECONDS)
+                if ladder_data is None:
+                    continue
+                ladder = extract_ladder(ladder_data, grade_id, grade_names_by_id.get(grade_id), bonbeach_team_ids, all_team_names)
+                if ladder:
+                    all_ladders.append(ladder)
 
     print(f"\nNew Bonbeach games this run: {games_processed}")
     print(f"Players with new activity this run: {len(players)}")
@@ -1183,6 +1335,7 @@ def main():
         "milestones_reached": milestones_reached_display,
         "latest_results": latest_results,
         "upcoming_fixtures": upcoming_fixtures,
+        "ladders": all_ladders,
     }
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -1197,6 +1350,7 @@ def main():
     print(f"Milestones log now covers {len(milestones_log)} milestones ({len(milestones_reached_display)} shown on the dashboard, last {MILESTONES_DISPLAY_WINDOW_DAYS} days).")
     print(f"Latest Results: {len(deduped_results)} completed Bonbeach matches found this season, showing the {len(latest_results)} most recent.")
     print(f"Upcoming Fixtures: {len(all_fixtures)} not-yet-played Bonbeach games found, showing the next round for {len(upcoming_fixtures)} team(s).")
+    print(f"Ladders: {len(all_ladders)} grade ladder(s) fetched for the current season.")
     print(f"Last updated: {datetime.now().strftime('%d %b %Y %H:%M')}")
     print("\nNext step: run  python build_dashboard.py")
 

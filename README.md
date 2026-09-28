@@ -15,7 +15,10 @@ automatically, once a day, and publishes it as a website via GitHub Pages.
 - `build_dashboard.py` injects that data into `dashboard_template.html` and
   writes two identical output files: `Bonbeach-CC-Milestone-Dashboard-LIVE.html`
   (a friendly name) and `index.html` (so GitHub Pages shows it at your site's
-  base URL automatically).
+  base URL automatically). It also injects the same data into
+  `fixtures_template.html`, producing `fixtures.html` — a second page (linked
+  from the main dashboard) with the upcoming round, the ladder for every
+  grade Bonbeach plays in, and this season's results.
 - `.github/workflows/update-dashboard.yml` runs both scripts once a day
   (early morning) and whenever you trigger it manually, then commits the
   regenerated HTML (and the updated baseline files) back to this repo —
@@ -133,20 +136,34 @@ it can usually diagnose and fix the script directly.
   PlayHQ — that part comes from the `baseline/` files (see above), so keep
   those committed.
 
+## The ladder — a note on confidence
+
+Unlike everything else in this pipeline, the ladder (`/v2/grades/{id}/ladders`)
+hasn't been confirmed against real PlayHQ data yet — there's no way to test
+it outside a real Actions run. It's built the same defensively-degrading way
+as everything else (a grade whose ladder doesn't parse just shows nothing
+for that grade, never a broken run), and every run prints one full raw
+ladder response to the Actions log the first time it's fetched, specifically
+so it can be checked and corrected quickly if the real shape turns out to be
+different from what's assumed. If the Ladder section looks empty or wrong
+on the site, bring that log block back to Claude.
+
 ## Files in this folder
 
 | File | What it is |
 |---|---|
 | `fetch_playhq_data.py` | Talks to PlayHQ, downloads new Bonbeach games, merges them into the baseline. Reads credentials from environment variables — no secrets in this file. |
-| `build_dashboard.py` | Injects the fresh data into the dashboard template |
-| `dashboard_template.html` | The dashboard design/logic (don't need to touch this) |
+| `build_dashboard.py` | Injects the fresh data into both page templates below |
+| `dashboard_template.html` | The main dashboard's design/logic (don't need to touch this) |
+| `fixtures_template.html` | The Fixtures/Results/Ladder page's design/logic (don't need to touch this) |
 | `.github/workflows/update-dashboard.yml` | The daily automation |
 | `baseline/player_totals.json` | **Committed** — full career totals per player. This is the club's permanent record; never delete or hand-edit it. |
 | `baseline/counted_game_ids.json` | **Committed** — PlayHQ game IDs already counted, so games are never double-counted. |
 | `milestones/milestones_log.json` | **Committed** — permanent record of every milestone ever reached, powering the "Milestones Reached" section. |
 | `players_data.json` | Generated, gitignored — the combined (baseline + new PlayHQ games) stats, machine-readable |
-| `Bonbeach-CC-Milestone-Dashboard-LIVE.html` / `index.html` | Generated, **committed** (see note below) — open either in your browser, or visit the live GitHub Pages URL |
+| `Bonbeach-CC-Milestone-Dashboard-LIVE.html` / `index.html` | Generated, **committed** (see note below) — the main dashboard, open either in your browser or visit the live GitHub Pages URL |
+| `fixtures.html` | Generated, **committed** — the Fixtures/Results/Ladder page, linked from `index.html` |
 
-**Note on `index.html`:** unlike `players_data.json`, this one *is* meant to
-be committed — GitHub Pages serves it directly, and the daily workflow
-updates it in place each run.
+**Note on `index.html` and `fixtures.html`:** unlike `players_data.json`,
+these two *are* meant to be committed — GitHub Pages serves them directly,
+and the daily workflow updates both in place each run.
