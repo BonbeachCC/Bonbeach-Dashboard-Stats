@@ -123,10 +123,11 @@ MILESTONES_DISPLAY_WINDOW_DAYS = 30
 # discovered), so the latest results can just be recomputed fresh each time.
 MAX_RESULTS_SHOWN = 15
 
-# How many of Bonbeach's next upcoming (not-yet-played) matches to show on
-# the dashboard's "Upcoming Fixtures" section. Same story as results — no
-# extra API calls needed, this is recomputed fresh each run from the same
-# fixture list crawl.
+# Safety cap on how many "Upcoming Fixtures" cards can ever show at once.
+# Doesn't normally come into play: the dashboard shows just the ONE next
+# round (the next not-yet-played game per Bonbeach team, see main()), and
+# with 8 teams that's naturally well under this. It's here so a future
+# schedule quirk (e.g. more teams added) can't ever flood the section.
 MAX_FIXTURES_SHOWN = 10
 
 HEADERS = {
@@ -1032,6 +1033,10 @@ def main():
     fixtures_seen = set()
     all_results = []   # Bonbeach match results, across every season/grade seen this run
     all_fixtures = []  # Bonbeach upcoming (not-yet-played) games, same deal
+    current_season_ids = set()  # season(s) that have any not-yet-played game —
+    # i.e. the season actually being played right now. "Latest Results" is
+    # scoped to just this, so old seasons never show up there again once a
+    # new one starts — no need to hand-maintain a season name/year anywhere.
 
     for season in seasons:
         season_id = season.get("id")
@@ -1075,6 +1080,7 @@ def main():
                         fixture = extract_fixture(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names)
                         if fixture:
                             all_fixtures.append(fixture)
+                            current_season_ids.add(season_id)
                     continue
 
                 if game_id in games_seen:
@@ -1088,6 +1094,7 @@ def main():
                 # the next run onward, without waiting for brand-new games.
                 match_result = extract_match_result(g, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names)
                 if match_result:
+                    match_result["_season_id"] = season_id  # internal only — stripped before writing out
                     all_results.append(match_result)
 
                 if game_id in counted_game_ids:
@@ -1135,21 +1142,39 @@ def main():
     milestones_reached_display = recent_milestones(milestones_log, run_date)
 
     # De-dupe (a game could in principle be seen twice if it spans grades data
-    # oddly) and take the most recent MAX_RESULTS_SHOWN by date, newest first.
+    # oddly), keep only results from the CURRENT season (the one with
+    # upcoming fixtures — see current_season_ids above; last season's results
+    # shouldn't keep showing once a new season's underway), and take the most
+    # recent MAX_RESULTS_SHOWN by date, newest first.
     seen_result_games = set()
     deduped_results = []
     for r in all_results:
         if r["game_id"] in seen_result_games:
             continue
         seen_result_games.add(r["game_id"])
+        if current_season_ids and r.get("_season_id") not in current_season_ids:
+            continue
         deduped_results.append(r)
     deduped_results.sort(key=lambda r: r.get("date") or "", reverse=True)
     latest_results = deduped_results[:MAX_RESULTS_SHOWN]
+    for r in latest_results:
+        r.pop("_season_id", None)  # internal-only tag, never sent to the dashboard
 
-    # Fixtures: drop anything dated before today (a not-yet-FINAL game whose
-    # date has already passed is most likely just pending a score update, not
-    # a genuine upcoming fixture), then take the soonest MAX_FIXTURES_SHOWN.
-    upcoming_fixtures = [f for f in all_fixtures if (f.get("date") or "9999-99-99") >= run_date]
+    # Fixtures: just the upcoming ROUND, not every future round stacked up.
+    # Drop anything dated before today (a not-yet-FINAL game whose date has
+    # already passed is most likely just pending a score update, not a
+    # genuine upcoming fixture), then keep only the SOONEST remaining game
+    # for each individual Bonbeach team — since different teams' rounds
+    # don't all fall on the same date (byes, different grades/formats), this
+    # is what actually gives "this round" rather than a fixed date filter.
+    not_yet_passed = [f for f in all_fixtures if (f.get("date") or "9999-99-99") >= run_date]
+    soonest_per_team = {}
+    for f in not_yet_passed:
+        team = f.get("bonbeach_team") or "Bonbeach"
+        sort_key = (f.get("date") or "9999-99-99", f.get("time") or "")
+        if team not in soonest_per_team or sort_key < soonest_per_team[team][0]:
+            soonest_per_team[team] = (sort_key, f)
+    upcoming_fixtures = [f for _, f in soonest_per_team.values()]
     upcoming_fixtures.sort(key=lambda f: (f.get("date") or "9999-99-99", f.get("time") or ""))
     upcoming_fixtures = upcoming_fixtures[:MAX_FIXTURES_SHOWN]
 
@@ -1170,8 +1195,8 @@ def main():
     print(f"\nDone! Wrote {len(output)} players (full career history) to {OUTPUT_FILE}")
     print(f"Baseline now covers {len(counted_game_ids)} games and {len(baseline_totals)} players.")
     print(f"Milestones log now covers {len(milestones_log)} milestones ({len(milestones_reached_display)} shown on the dashboard, last {MILESTONES_DISPLAY_WINDOW_DAYS} days).")
-    print(f"Latest Results: {len(deduped_results)} completed Bonbeach matches found, showing the {len(latest_results)} most recent.")
-    print(f"Upcoming Fixtures: {len(all_fixtures)} not-yet-played Bonbeach games found, showing the next {len(upcoming_fixtures)}.")
+    print(f"Latest Results: {len(deduped_results)} completed Bonbeach matches found this season, showing the {len(latest_results)} most recent.")
+    print(f"Upcoming Fixtures: {len(all_fixtures)} not-yet-played Bonbeach games found, showing the next round for {len(upcoming_fixtures)} team(s).")
     print(f"Last updated: {datetime.now().strftime('%d %b %Y %H:%M')}")
     print("\nNext step: run  python build_dashboard.py")
 
