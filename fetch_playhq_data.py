@@ -93,6 +93,14 @@ if not X_API_KEY or not ORGANISATION_ID:
 
 CLUB_NAME_MATCH = "bonbeach"  # used as a fallback text match on club name, lowercase
 
+# One-off diagnostic (not part of the normal daily site build): when true,
+# prints every Bonbeach team's FULL season schedule — every round, every
+# team, including byes — to this run's Actions log, for whenever someone
+# needs to plan around fixtures (e.g. picking a weekend for a club function)
+# rather than just the "next round" the live site shows. Turned on via the
+# "Run workflow" button's checkbox, never on the daily scheduled run.
+DUMP_FULL_FIXTURES = os.environ.get("DUMP_FULL_FIXTURES", "false").strip().lower() == "true"
+
 OUTPUT_FILE = "players_data.json"
 CACHE_FILE = "_playhq_raw_cache.json"   # lets you resume/re-run without re-downloading everything
 REQUEST_DELAY_SECONDS = 0.25            # be polite to PlayHQ's servers between calls
@@ -121,14 +129,14 @@ MILESTONES_DISPLAY_WINDOW_DAYS = 30
 # a permanent log file — every run already re-walks the full fixture list for
 # every season/grade Bonbeach has ever played in (that's how new games get
 # discovered), so the latest results can just be recomputed fresh each time.
-MAX_RESULTS_SHOWN = 15
+MAX_RESULTS_SHOWN = 20  # safety cap; normal limiting is one (latest) result per team
 
 # Safety cap on how many "Upcoming Fixtures" cards can ever show at once.
 # Doesn't normally come into play: the dashboard shows just the ONE next
 # round (the next not-yet-played game per Bonbeach team, see main()), and
 # with 8 teams that's naturally well under this. It's here so a future
 # schedule quirk (e.g. more teams added) can't ever flood the section.
-MAX_FIXTURES_SHOWN = 10
+MAX_FIXTURES_SHOWN = 20
 
 HEADERS = {
     "x-api-key": X_API_KEY,
@@ -262,6 +270,10 @@ def get_grade_ladder(grade_id):
 
 
 _debug_dumped_raw_ladder = False
+# Every diagnostic dump is also kept here and written into the (committed) page
+# data as "diagnostics", so it can be read straight off the live site — no one
+# has to copy anything out of the Actions log.
+_DIAGNOSTICS = []
 
 
 def _maybe_dump_raw_ladder(ladder_data, grade_id):
@@ -279,6 +291,7 @@ def _maybe_dump_raw_ladder(ladder_data, grade_id):
             dumped = dumped[:6000] + "\n... (truncated)"
         print(f"    DIAGNOSTIC: raw shape of one real ladder response (grade {grade_id}, printed once per run) —")
         print(dumped)
+        _DIAGNOSTICS.append({"label": f"ladder (grade {grade_id})", "raw": dumped})
     except Exception as e:
         print(f"    DIAGNOSTIC: couldn't dump raw ladder for grade {grade_id}: {e}")
 
@@ -519,6 +532,7 @@ def _maybe_dump_raw_game(game, label):
             dumped = dumped[:6000] + "\n... (truncated)"
         print(f"    DIAGNOSTIC: raw shape of one real '{label}' game (printed once per run) —")
         print(dumped)
+        _DIAGNOSTICS.append({"label": label, "raw": dumped})
     except Exception as e:
         print(f"    DIAGNOSTIC: couldn't dump raw game for '{label}': {e}")
 
@@ -596,14 +610,16 @@ def _competitor_outcome(c):
     (shown as 'Result unknown') for anything unrecognised. Deliberately
     conservative: an unrecognised value is left blank rather than guessed."""
     raw = str(c.get("outcome") or c.get("result") or "").upper()
-    if raw in ("WON", "WIN", "WINNER"):
-        return "Won"
-    if raw in ("LOST", "LOSS", "LOSER"):
-        return "Lost"
-    if raw in ("DRAW", "DREW", "DRAWN"):
-        return "Drew"
-    if raw in ("TIE", "TIED"):
+    # Two-day matches use richer values than one-day ones (e.g. an outright or
+    # first-innings win), so match on the meaning rather than exact words.
+    if "TIE" in raw:
         return "Tied"
+    if "DRAW" in raw or "DREW" in raw:
+        return "Drew"
+    if any(w in raw for w in ("LOSS", "LOST", "LOSE", "LOSER")):
+        return "Lost"
+    if any(w in raw for w in ("WON", "WIN")):
+        return "Won"
     return None
 
 
@@ -630,6 +646,7 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
         _result_date, _ = _match_start_date_time(game)
         result = {
             "game_id": game.get("id"),
+            "team_id": bb.get("id"),  # internal — two teams can share a name (e.g. a Saturday and a Sunday "Bonbeach (2)")
             "date": _result_date or game.get("date"),
             "bonbeach_team": bonbeach_team_names.get(bb.get("id"), "Bonbeach"),
             "grade": bonbeach_grade_names.get(bb.get("id")),
@@ -640,6 +657,13 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
             "result": _competitor_outcome(bb),
             "venue": _venue_name(game),
         }
+
+        # Dump the first real game that came out with no outcome / no score, so
+        # one log paste shows exactly where PlayHQ keeps them for that kind of game.
+        if result["result"] is None:
+            _maybe_dump_raw_game(game, "result-with-no-outcome")
+        if result["bonbeach_score"] is None:
+            _maybe_dump_raw_game(game, "result-with-no-score")
 
         degraded = result["opponent"] == "Opponent" or result["bonbeach_score"] is None or result["result"] is None
         if degraded and not _debug_dumped_competitor:
@@ -695,6 +719,7 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
         fixture_date, fixture_time = _match_start_date_time(game)
         return {
             "game_id": game.get("id"),
+            "team_id": bb_id,  # internal — see extract_match_result
             "date": fixture_date or game.get("date"),
             "time": fixture_time,
             "bonbeach_team": bonbeach_team_names.get(bb_id, "Bonbeach"),
@@ -706,6 +731,63 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
     except Exception as e:
         print(f"    WARNING: couldn't extract a fixture for game {game.get('id')}: {e}")
         return None
+
+
+def compute_full_grade_schedule(games, team_id, all_team_names=None):
+    """Every round in this grade's full season, from ONE team's point of view
+    — the game they played (date/opponent/venue/status), or BYE if no game in
+    that round involved them at all. `games` is a whole grade's full game
+    list (every team, every round) from get_grade_fixture(), not just the
+    Bonbeach-filtered subset the rest of the pipeline uses — a bye can only
+    be detected by seeing which rounds exist for the GRADE but have no game
+    for this particular team.
+
+    Diagnostic-only: used for DUMP_FULL_FIXTURES, never for the live site."""
+    round_order = []
+    round_seen = set()
+    games_by_round = {}
+    for g in games:
+        rn = g.get("_round_name") or "Unknown round"
+        if rn not in round_seen:
+            round_seen.add(rn)
+            round_order.append(rn)
+        games_by_round.setdefault(rn, []).append(g)
+
+    schedule = []
+    for rn in round_order:
+        my_game = None
+        for g in games_by_round.get(rn, []):
+            team_ids_in_game = {t.get("id") for t in (g.get("teams") or []) if isinstance(t, dict)}
+            if team_id in team_ids_in_game:
+                my_game = g
+                break
+        if my_game is None:
+            schedule.append({"round": rn, "status": "BYE"})
+            continue
+        date, time_ = _match_start_date_time(my_game)
+        opp = None
+        for c in _get_competitors(my_game):
+            if c.get("id") != team_id:
+                opp = c
+        schedule.append({
+            "round": rn,
+            "date": date,
+            "time": time_,
+            "opponent": _competitor_name(opp, all_team_names) if opp else "TBC",
+            "venue": _venue_name(my_game),
+            "status": my_game.get("status"),
+        })
+    return schedule
+
+
+def dump_full_fixtures_for_team(team_name, grade_name, schedule):
+    print(f"\nFULL SEASON — {team_name} ({grade_name}):")
+    for row in schedule:
+        if row.get("status") == "BYE":
+            print(f"    {row['round']}: BYE")
+        else:
+            print(f"    {row['round']}: {row.get('date')} {row.get('time') or ''} vs {row.get('opponent')} "
+                  f"@ {row.get('venue')} [{row.get('status')}]")
 
 
 # =========================================================================
@@ -720,6 +802,7 @@ def blank_player():
         "wickets": 0, "runs_conceded": 0, "balls_bowled": 0, "best_w": 0, "best_r": 0, "five_wkts": 0,
         "catches_wk": 0, "catches_nwk": 0, "stumpings": 0, "run_outs": 0,
         "first_name": "", "last_name": "",
+        "last_played_date": None,  # YYYY-MM-DD of the most recent game seen for this player this run
     }
 
 
@@ -759,7 +842,7 @@ def player_key(last, first):
     return f"{last}, {first}".strip(", ").lower()
 
 
-def process_game_summary(summary, bonbeach_team_ids, players):
+def process_game_summary(summary, bonbeach_team_ids, players, game_date=None):
     if not summary:
         return
 
@@ -794,6 +877,8 @@ def process_game_summary(summary, bonbeach_team_ids, players):
                 if not p["first_name"] and not p["last_name"]:
                     p["first_name"], p["last_name"] = gentle_capitalize(first), gentle_capitalize(last)
                 p["matches_set"].add(game_id)
+                if game_date and (not p["last_played_date"] or game_date > p["last_played_date"]):
+                    p["last_played_date"] = game_date
 
                 stats = appearance.get("statistics", []) or []
 
@@ -855,6 +940,7 @@ def blank_baseline_entry():
         "wickets": 0, "runs_conceded": 0, "balls_bowled": 0,
         "best_w": 0, "best_r": 0, "five_wkts": 0,
         "catches_wk": 0, "catches_nwk": 0, "stumpings": 0, "run_outs": 0,
+        "last_played_date": None,  # YYYY-MM-DD, most recent PlayHQ game on record for this player
     }
 
 
@@ -932,6 +1018,10 @@ def merge_into_baseline(baseline_totals, live_deltas):
             b["high_score"] = delta["high_score"]
             b["high_score_not_out"] = delta["high_score_not_out"]
 
+        d_last_played = delta.get("last_played_date")
+        if d_last_played and (not b.get("last_played_date") or d_last_played > b["last_played_date"]):
+            b["last_played_date"] = d_last_played
+
         dw, dr = delta["best_w"], delta["best_r"]
         if dw > 0 or dr > 0:  # delta actually took a wicket-bearing spell worth comparing
             if b["best_w"] == 0 and b["best_r"] == 0:
@@ -949,6 +1039,8 @@ def merge_into_baseline(baseline_totals, live_deltas):
 def finalize(baseline_totals):
     output = []
     for key, p in baseline_totals.items():
+        if key == "_meta":
+            continue  # internal bookkeeping (one-time backfill flag), not a player
         matches = p["matches"]
         if matches == 0:
             continue
@@ -983,6 +1075,7 @@ def finalize(baseline_totals):
             "catches_nwk": int(p["catches_nwk"]),
             "stumpings": int(p["stumpings"]),
             "run_outs": int(p["run_outs"]),
+            "last_played_date": p.get("last_played_date"),
         }
         output.append(record)
 
@@ -1001,6 +1094,16 @@ RUN_TIERS = [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000,
 WICKET_TIERS = [100, 150, 200, 250, 300, 350, 400, 450, 500, 550]
 CATCH_TIERS = [100, 150, 200, 250, 300, 350, 400, 450, 500]
 WATCH = {"matches": 5, "runs": 100, "wickets": 10}
+
+# Players whose last known Bonbeach game is before this date are excluded from
+# Milestone Watch (the dedicated board, the "Watch" badge/tab, and the star in
+# the player dropdown) even if they're numerically close to a milestone —
+# Bryce's call (29 Sep 2026), so retired/inactive players don't clutter the
+# tracker forever. A player with no PlayHQ record at all (last_played_date is
+# None — i.e. their whole history predates PlayHQ, or the one-time backfill
+# below hasn't reached them yet) is treated as inactive too. To move the
+# cutoff later, just change this one line.
+MILESTONE_WATCH_ACTIVE_SINCE = "2025-03-01"
 
 
 def next_milestone(value, tiers, increment):
@@ -1137,6 +1240,15 @@ def apply_milestones(players):
         if 0 < p["wickets_to_go"] <= WATCH["wickets"]:
             watches.append({"type": "Wickets", "current": p["wickets"], "target": nw, "to_go": p["wickets_to_go"]})
         # NOTE: Catches deliberately excluded from milestone watch per club decision
+
+        # Hide inactive players from Milestone Watch specifically (their raw
+        # stats/milestones-to-go still show fine elsewhere on the dashboard —
+        # this only suppresses the "closing in!" watch flag).
+        last_played = p.get("last_played_date")
+        active_enough = bool(last_played) and last_played >= MILESTONE_WATCH_ACTIVE_SINCE
+        if not active_enough:
+            watches = []
+
         p["watches"] = watches
         p["is_watch"] = len(watches) > 0
 
@@ -1162,6 +1274,21 @@ def main():
     milestones_log = load_milestones_log()
     print(f"Baseline: {len(baseline_totals)} players, {len(counted_game_ids)} games already counted")
     print(f"Milestones log: {len(milestones_log)} milestones on record")
+
+    run_date = today_iso()  # computed up-front so both the backfill pass below and
+    # everything later in this function (fixture cutoffs, milestone log dates) agree
+
+    # One-time backfill: the "last played" date wasn't tracked before this feature
+    # existed, so every already-counted game's summary needs fetching ONCE more to
+    # find out. After this run finishes, baseline_totals["_meta"] records that it's
+    # done, so every future run only pays for summaries on brand-new games as usual.
+    meta = baseline_totals.get("_meta") or {}
+    needs_last_played_backfill = not meta.get("last_played_backfilled")
+    backfill_players = {}  # date-only info for already-counted games, this run
+    if needs_last_played_backfill:
+        print("\nRunning one-time backfill: fetching every already-counted game's summary "
+              "once more to find each player's last-played date. This run will take a bit "
+              "longer than usual; every future run goes back to normal speed.")
 
     players = {}       # NEW games only, this run
     games_processed = 0
@@ -1207,6 +1334,13 @@ def main():
             ]
             print(f"    Grade {grade_id}: {len(relevant_games)} Bonbeach games")
 
+            if DUMP_FULL_FIXTURES:
+                for t in bonbeach_teams:
+                    if (t.get("grade") or {}).get("id") != grade_id:
+                        continue
+                    schedule = compute_full_grade_schedule(games, t["id"], all_team_names)
+                    dump_full_fixtures_for_team(t.get("name") or "Bonbeach", grade_names_by_id.get(grade_id), schedule)
+
             for g in relevant_games:
                 game_id = g.get("id")
 
@@ -1236,13 +1370,25 @@ def main():
                     match_result["_season_id"] = season_id  # internal only — stripped before writing out
                     all_results.append(match_result)
 
+                game_date, _ = _match_start_date_time(g)  # no API call — same game dict already in hand
+
                 if game_id in counted_game_ids:
-                    continue  # already folded into the baseline on a previous run
+                    # Already folded into the baseline's stat totals on a previous run —
+                    # no need to re-aggregate. But on the ONE-TIME backfill run, still
+                    # fetch the summary just to find out who played and when, so
+                    # last_played_date exists for players whose most recent game was
+                    # already counted before this feature existed.
+                    if needs_last_played_backfill:
+                        summary = get_game_summary(game_id)
+                        time.sleep(REQUEST_DELAY_SECONDS)
+                        if summary:
+                            process_game_summary(summary, bonbeach_team_ids, backfill_players, game_date=game_date)
+                    continue
 
                 summary = get_game_summary(game_id)
                 time.sleep(REQUEST_DELAY_SECONDS)
                 if summary:
-                    process_game_summary(summary, bonbeach_team_ids, players)
+                    process_game_summary(summary, bonbeach_team_ids, players, game_date=game_date)
                     games_new_ids.add(game_id)
                     games_processed += 1
                     if games_processed % 25 == 0:
@@ -1278,13 +1424,25 @@ def main():
             "catches": b.get("catches_wk", 0) + b.get("catches_nwk", 0),
         }
 
+    if needs_last_played_backfill:
+        # Fold in the just-discovered last-played dates for players whose most
+        # recent game was already counted before this feature existed — date
+        # only, never touching their already-correct stat totals.
+        for key, delta in backfill_players.items():
+            b = baseline_totals.setdefault(key, blank_baseline_entry())
+            d_last_played = delta.get("last_played_date")
+            if d_last_played and (not b.get("last_played_date") or d_last_played > b["last_played_date"]):
+                b["last_played_date"] = d_last_played
+        baseline_totals["_meta"] = {"last_played_backfilled": True, "backfilled_on": run_date}
+        print(f"\nOne-time backfill: recorded last-played dates for {len(backfill_players)} "
+              f"players from already-counted games. This won't run again.")
+
     baseline_totals = merge_into_baseline(baseline_totals, players)
     counted_game_ids |= games_new_ids
 
     output = finalize(baseline_totals)
     output = apply_milestones(output)
 
-    run_date = today_iso()
     new_milestone_events = detect_milestones_reached(pre_stats, output, run_date)
     if new_milestone_events:
         print(f"\nMilestones reached this run: {len(new_milestone_events)}")
@@ -1308,7 +1466,14 @@ def main():
             continue
         deduped_results.append(r)
     deduped_results.sort(key=lambda r: r.get("date") or "", reverse=True)
-    latest_results = deduped_results[:MAX_RESULTS_SHOWN]
+    # Latest result for EACH team (their most recent game), not just the
+    # club-wide most recent few — otherwise a busy Saturday crowds out teams.
+    latest_per_team = {}
+    for r in deduped_results:  # already newest-first, so first seen = latest
+        key = r.get("team_id") or (r.get("bonbeach_team"), r.get("grade"))
+        if key not in latest_per_team:
+            latest_per_team[key] = r
+    latest_results = list(latest_per_team.values())[:MAX_RESULTS_SHOWN]
     for r in latest_results:
         r.pop("_season_id", None)  # internal-only tag, never sent to the dashboard
 
@@ -1322,7 +1487,7 @@ def main():
     not_yet_passed = [f for f in all_fixtures if (f.get("date") or "9999-99-99") >= run_date]
     soonest_per_team = {}
     for f in not_yet_passed:
-        team = f.get("bonbeach_team") or "Bonbeach"
+        team = f.get("team_id") or (f.get("bonbeach_team"), f.get("grade"))
         sort_key = (f.get("date") or "9999-99-99", f.get("time") or "")
         if team not in soonest_per_team or sort_key < soonest_per_team[team][0]:
             soonest_per_team[team] = (sort_key, f)
@@ -1336,6 +1501,7 @@ def main():
         "latest_results": latest_results,
         "upcoming_fixtures": upcoming_fixtures,
         "ladders": all_ladders,
+        "diagnostics": _DIAGNOSTICS,  # raw PlayHQ samples, never displayed — for debugging only
     }
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -1348,9 +1514,13 @@ def main():
     print(f"\nDone! Wrote {len(output)} players (full career history) to {OUTPUT_FILE}")
     print(f"Baseline now covers {len(counted_game_ids)} games and {len(baseline_totals)} players.")
     print(f"Milestones log now covers {len(milestones_log)} milestones ({len(milestones_reached_display)} shown on the dashboard, last {MILESTONES_DISPLAY_WINDOW_DAYS} days).")
-    print(f"Latest Results: {len(deduped_results)} completed Bonbeach matches found this season, showing the {len(latest_results)} most recent.")
+    print(f"Latest Results: {len(deduped_results)} completed Bonbeach matches found this season, showing the latest result for {len(latest_results)} team(s).")
     print(f"Upcoming Fixtures: {len(all_fixtures)} not-yet-played Bonbeach games found, showing the next round for {len(upcoming_fixtures)} team(s).")
     print(f"Ladders: {len(all_ladders)} grade ladder(s) fetched for the current season.")
+    on_watch = sum(1 for p in output if p["is_watch"])
+    inactive = sum(1 for p in output if not (p.get("last_played_date") and p["last_played_date"] >= MILESTONE_WATCH_ACTIVE_SINCE))
+    print(f"Milestone Watch: {on_watch} player(s) currently shown (players inactive since before "
+          f"{MILESTONE_WATCH_ACTIVE_SINCE} are excluded — {inactive} of {len(output)} players fall into that group).")
     print(f"Last updated: {datetime.now().strftime('%d %b %Y %H:%M')}")
     print("\nNext step: run  python build_dashboard.py")
 
