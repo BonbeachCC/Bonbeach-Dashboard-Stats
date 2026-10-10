@@ -605,6 +605,62 @@ def _competitor_score_display(c):
     return str(runs)
 
 
+def _team_innings(game, team_id):
+    """Every innings this team batted in a game, from the game's own `periods`
+    (confirmed real shape: periods[].teams[].outcome.statistics with
+    TOTAL_SCORE / TOTAL_OUTS / TOTAL_OVERS). One-day games have one innings per
+    team; two-day games can have more. Never raises — returns [] if the shape
+    isn't what's expected."""
+    out = []
+    try:
+        periods = game.get("periods")
+        if not isinstance(periods, list):
+            return out
+        def seq(p):
+            try:
+                return int(p.get("sequenceNo"))
+            except (TypeError, ValueError):
+                return 0
+        for p in sorted([p for p in periods if isinstance(p, dict)], key=seq):
+            for t in (p.get("teams") or []):
+                if not isinstance(t, dict) or t.get("id") != team_id:
+                    continue
+                o = _as_dict(t.get("outcome"))
+                stats = {st.get("type"): st.get("value") for st in (o.get("statistics") or []) if isinstance(st, dict)}
+                if stats.get("TOTAL_SCORE") is None:
+                    continue
+                out.append({
+                    "runs": stats.get("TOTAL_SCORE"),
+                    "wickets": stats.get("TOTAL_OUTS"),
+                    "overs": stats.get("TOTAL_OVERS"),
+                    "status": o.get("status"),
+                })
+    except Exception:
+        return []
+    return out
+
+
+def _team_score_display(game, team_id, competitor=None):
+    """Human score like '215/4 dec' or '82/10' (two-day: '215/4 dec & 120/3').
+    Falls back to the older competitor-based guess if `periods` has nothing."""
+    innings = _team_innings(game, team_id)
+    if innings:
+        parts = []
+        for i in innings:
+            try:
+                txt = f"{int(i['runs'])}"
+                if i.get("wickets") is not None:
+                    txt += f"/{int(i['wickets'])}"
+                if str(i.get("status") or "").upper() in ("COMPULSORY_CLOSE", "DECLARED", "DECLARATION"):
+                    txt += " dec"
+                parts.append(txt)
+            except (TypeError, ValueError):
+                continue
+        if parts:
+            return " & ".join(parts)
+    return _competitor_score_display(competitor) if competitor else None
+
+
 def _competitor_outcome(c):
     """Normalise PlayHQ's outcome value into Won/Lost/Drew/Tied — or None
     (shown as 'Result unknown') for anything unrecognised. Deliberately
@@ -652,8 +708,10 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
             "grade": bonbeach_grade_names.get(bb.get("id")),
             "round": game.get("_round_name"),
             "opponent": _competitor_name(opp, all_team_names),
-            "bonbeach_score": _competitor_score_display(bb),
-            "opponent_score": _competitor_score_display(opp),
+            "bonbeach_score": _team_score_display(game, bb.get("id"), bb),
+            "bonbeach_innings": _team_innings(game, bb.get("id")),
+            "opponent_score": _team_score_display(game, opp.get("id"), opp),
+            "opponent_innings": _team_innings(game, opp.get("id")),
             "result": _competitor_outcome(bb),
             "venue": _venue_name(game),
         }
@@ -679,6 +737,18 @@ def extract_match_result(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_
 
 
 _NOT_PLAYING_STATUS_HINTS = ("CANCEL", "ABANDON", "FORFEIT", "WASHOUT", "WASHED_OUT", "POSTPONED")
+
+
+def _is_home_team(game, team_id):
+    """True/False from PlayHQ's own isHomeTeam flag on the game's `teams`
+    entries (confirmed real field); None if it isn't there."""
+    try:
+        for t in (game.get("teams") or []):
+            if isinstance(t, dict) and t.get("id") == team_id and isinstance(t.get("isHomeTeam"), bool):
+                return t["isHomeTeam"]
+    except Exception:
+        pass
+    return None
 
 
 def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade_names, all_team_names=None):
@@ -727,6 +797,7 @@ def extract_fixture(game, bonbeach_team_ids, bonbeach_team_names, bonbeach_grade
             "round": game.get("_round_name"),
             "opponent": _competitor_name(opp, all_team_names) if opp else "TBC",
             "venue": _venue_name(game),
+            "is_home": _is_home_team(game, bb_id),
         }
     except Exception as e:
         print(f"    WARNING: couldn't extract a fixture for game {game.get('id')}: {e}")
@@ -793,6 +864,44 @@ def dump_full_fixtures_for_team(team_name, grade_name, schedule):
 # =========================================================================
 # Step 5: Aggregation logic
 # =========================================================================
+
+def _short_name(first, last):
+    first, last = gentle_capitalize(first or ""), gentle_capitalize(last or "")
+    return f"{first[:1]} {last}".strip() if first else last
+
+
+def top_performances(summary, team_id, how_many=2):
+    """Top individual batting and bowling performances for ONE team in ONE game,
+    from the full game summary (same real shape process_game_summary reads).
+    Returns (batters, bowlers) as lists of display strings like 'J Smith 64*'
+    and 'M Hogan 3/20'. Never raises."""
+    try:
+        names = {a["id"]: _short_name(a.get("firstName"), a.get("lastName")) for a in (summary.get("appearances") or []) if a.get("id")}
+        bats, bowls = [], []
+        for period in summary.get("periods") or []:
+            for tb in period.get("teams") or []:
+                if tb.get("id") != team_id:
+                    continue
+                for ap in tb.get("appearances") or []:
+                    nm = names.get(ap.get("id"))
+                    if not nm:
+                        continue
+                    stats = ap.get("statistics") or []
+                    if tb.get("discipline") == "BATTING":
+                        if ap.get("status") == "DID_NOT_BAT":
+                            continue
+                        bats.append((stat_value(stats, "TOTAL_RUNS"), ap.get("status") == "NOT_OUT", nm))
+                    elif tb.get("discipline") == "BOWLING":
+                        w, r = stat_value(stats, "WICKETS"), stat_value(stats, "RUNS")
+                        if w and w > 0:
+                            bowls.append((w, r, nm))
+        bats.sort(key=lambda x: -x[0])
+        bowls.sort(key=lambda x: (-x[0], x[1]))
+        return ([f"{n} {int(r)}{'*' if no else ''}" for r, no, n in bats[:how_many]],
+                [f"{n} {int(w)}/{int(r)}" for w, r, n in bowls[:how_many]])
+    except Exception:
+        return [], []
+
 
 def blank_player():
     return {
@@ -1476,6 +1585,15 @@ def main():
     latest_results = list(latest_per_team.values())[:MAX_RESULTS_SHOWN]
     for r in latest_results:
         r.pop("_season_id", None)  # internal-only tag, never sent to the dashboard
+        # Top two batters / bowlers for the Bonbeach side — one extra call per
+        # displayed result (at most one per team), used for social graphics.
+        try:
+            summ = get_game_summary(r["game_id"])
+            time.sleep(REQUEST_DELAY_SECONDS)
+            if summ:
+                r["top_batters"], r["top_bowlers"] = top_performances(summ, r.get("team_id"))
+        except Exception as e:
+            print(f"    WARNING: couldn't get top performers for game {r.get('game_id')}: {e}")
 
     # Fixtures: just the upcoming ROUND, not every future round stacked up.
     # Drop anything dated before today (a not-yet-FINAL game whose date has
